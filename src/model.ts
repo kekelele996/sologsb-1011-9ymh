@@ -16,6 +16,8 @@ export interface CaptionSegment {
   state: SegmentState;
   duplicateOf?: string;
   staleReason?: string;
+  /** 进入重复/过期异常的时间，用于交接里的“最近十分钟新增风险”。 */
+  flaggedAt?: number;
   revision: number;
   tags: string[];
 }
@@ -31,11 +33,85 @@ export interface TermRule {
   createdAt: number;
 }
 
+export interface HandoverSpeakerStat {
+  speaker: string;
+  /** 修改次数合计（所有片段 revision 之和）。 */
+  revisions: number;
+  /** 有修改的片段数。 */
+  edited: number;
+  confirmed: number;
+  pending: number;
+  stale: number;
+  duplicate: number;
+  ignored: number;
+  /** 应用过术语规则的片段数。 */
+  ruleHits: number;
+  /** 该发言人专属规则的累计调用次数。 */
+  scopedRuleUses: number;
+}
+
+export interface HandoverRuleStat {
+  id: string;
+  source: string;
+  replacement: string;
+  scope: string;
+  usageCount: number;
+  /** 当前仍命中规则但尚未应用的片段数（常被忽略的规则）。 */
+  missed: number;
+}
+
+export interface HandoverOpenItem {
+  segmentId: string;
+  sequence: number;
+  speaker: string;
+  state: SegmentState | 'outbox';
+  stateLabel: string;
+  text: string;
+  waitSeconds: number;
+  note: string;
+}
+
+export interface HandoverRisk {
+  segmentId: string;
+  sequence: number;
+  speaker: string;
+  kind: 'stale' | 'duplicate';
+  kindLabel: string;
+  detectedAt: number;
+  text: string;
+  note: string;
+}
+
+export interface HandoverResolution {
+  segmentId: string;
+  sequence: number;
+  speaker: string;
+  wasLabel: string;
+  nowLabel: string;
+  text: string;
+}
+
+/** 值守交接快照：生成后冻结，后续校对不再改写。 */
+export interface HandoverReport {
+  id: string;
+  shift: number;
+  createdAt: number;
+  connection: ConnectionState;
+  speakers: HandoverSpeakerStat[];
+  rules: HandoverRuleStat[];
+  openItems: HandoverOpenItem[];
+  recentRisks: HandoverRisk[];
+  /** 相对上一份交接已被处理掉的未处理项。 */
+  resolved: HandoverResolution[];
+  totals: { pending: number; stale: number; duplicate: number; outbox: number; confirmed: number };
+}
+
 export interface DeskModel {
   eventName: string;
   eventDate: string;
   segments: CaptionSegment[];
   rules: TermRule[];
+  handovers: HandoverReport[];
   selectedId: string;
   connection: ConnectionState;
   simulatedDelay: number;
@@ -97,6 +173,7 @@ const duplicate: CaptionSegment = {
   source: 'live',
   duplicateOf: 'seg-2',
   staleReason: '与第 2 段高度相似',
+  flaggedAt: now - 6 * 60_000,
 };
 
 export function createInitialModel(): DeskModel {
@@ -109,6 +186,7 @@ export function createInitialModel(): DeskModel {
       { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
       { id: 'term-3', source: '五G', replacement: '5G', speaker: '', enabled: true, caseSensitive: true, usageCount: 2, createdAt: now - 3_600_000 },
     ],
+    handovers: [],
     selectedId: 'seg-4',
     connection: 'connected',
     simulatedDelay: 1.8,
@@ -200,10 +278,14 @@ export function mergeConfirmedSegments(model: DeskModel): DeskModel {
       if (item.source === 'offline' && item.state === 'confirmed') {
         item.source = item.confirmedAt && Date.now() - item.confirmedAt > 90_000 ? 'offline' : 'live';
         item.staleReason = Date.now() - item.receivedAt > 90_000 ? `离线恢复后合并，原始片段已延迟 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒` : undefined;
-        if (item.staleReason) item.state = 'stale';
+        if (item.staleReason) {
+          item.flaggedAt = Date.now();
+          item.state = 'stale';
+        }
       }
       const duplicate = isDuplicate(item, seen.map((id) => model.segments.find((segmentItem) => segmentItem.id === id)).filter(Boolean) as CaptionSegment[]);
       if (duplicate && item.state !== 'confirmed') {
+        if (item.state !== 'duplicate') item.flaggedAt = Date.now();
         item.state = 'duplicate';
         item.duplicateOf = duplicate.id;
       }
@@ -234,6 +316,169 @@ export function queueStats(model: DeskModel) {
     backlog: pending.length + stale.length + duplicate.length + offline.length,
     oldestWaitSeconds: pending.length ? Math.max(...pending.map((item) => Math.round((Date.now() - item.receivedAt) / 1000))) : 0,
   };
+}
+
+export function segmentStateLabel(state: SegmentState): string {
+  return {
+    pending: '待确认',
+    confirmed: '已确认',
+    duplicate: '重复片段',
+    stale: '过期修改',
+    ignored: '已忽略',
+  }[state];
+}
+
+/** 交接中“新增风险”的统计窗口：最近 10 分钟。 */
+export const HANDOVER_RISK_WINDOW_MS = 10 * 60_000;
+
+function isOpenForHandover(item: CaptionSegment): boolean {
+  return item.state === 'pending' || item.state === 'stale' || item.state === 'duplicate'
+    || (item.state === 'confirmed' && item.source === 'offline');
+}
+
+/**
+ * 生成一份值守交接快照。返回值只包含派生数据，存入 model.handovers 后不再被后续校对改写；
+ * 下一份快照会通过对比上一份的 openItems 标出已解决的异常。
+ */
+export function buildHandoverReport(model: DeskModel, now = Date.now()): HandoverReport {
+  const speakerStats = new Map<string, HandoverSpeakerStat>();
+  const statFor = (speaker: string): HandoverSpeakerStat => {
+    const key = speaker || '未知发言人';
+    const existing = speakerStats.get(key);
+    if (existing) return existing;
+    const created: HandoverSpeakerStat = {
+      speaker: key, revisions: 0, edited: 0, confirmed: 0, pending: 0,
+      stale: 0, duplicate: 0, ignored: 0, ruleHits: 0, scopedRuleUses: 0,
+    };
+    speakerStats.set(key, created);
+    return created;
+  };
+  for (const item of model.segments) {
+    const stat = statFor(item.speaker);
+    stat.revisions += item.revision;
+    if (item.revision > 0) stat.edited += 1;
+    if (item.tags.includes('术语已应用')) stat.ruleHits += 1;
+    stat[item.state] += 1;
+  }
+  for (const rule of model.rules) {
+    if (!rule.speaker) continue;
+    const stat = speakerStats.get(rule.speaker);
+    if (stat) stat.scopedRuleUses += rule.usageCount;
+  }
+
+  const activeSegments = model.segments.filter((item) => item.state !== 'ignored');
+  const rules: HandoverRuleStat[] = model.rules
+    .map((rule) => {
+      const flags = rule.caseSensitive ? 'g' : 'gi';
+      const expression = new RegExp(rule.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+      // 未应用 = 应用该规则后文本会发生变化；已改正成目标文本的片段不算（replace 不受 lastIndex 影响）。
+      const missed = rule.source
+        ? activeSegments.filter((item) => (!rule.speaker || rule.speaker === item.speaker)
+            && item.corrected.replace(expression, rule.replacement) !== item.corrected).length
+        : 0;
+      return { id: rule.id, source: rule.source, replacement: rule.replacement, scope: rule.speaker || '全部发言人', usageCount: rule.usageCount, missed };
+    })
+    .sort((a, b) => b.missed - a.missed || b.usageCount - a.usageCount);
+
+  const openItems: HandoverOpenItem[] = model.segments
+    .filter(isOpenForHandover)
+    .sort((a, b) => a.sequence - b.sequence)
+    .map((item) => {
+      const outbox = item.state === 'confirmed';
+      return {
+        segmentId: item.id,
+        sequence: item.sequence,
+        speaker: item.speaker,
+        state: outbox ? 'outbox' : item.state,
+        stateLabel: outbox ? '离线待合并' : segmentStateLabel(item.state),
+        text: item.corrected,
+        waitSeconds: Math.max(0, Math.round((now - item.receivedAt) / 1000)),
+        note: item.staleReason ?? '',
+      };
+    });
+
+  const recentRisks: HandoverRisk[] = model.segments
+    .filter((item) => (item.state === 'stale' || item.state === 'duplicate')
+      && typeof item.flaggedAt === 'number' && now - item.flaggedAt <= HANDOVER_RISK_WINDOW_MS)
+    .sort((a, b) => (b.flaggedAt ?? 0) - (a.flaggedAt ?? 0))
+    .map((item) => ({
+      segmentId: item.id,
+      sequence: item.sequence,
+      speaker: item.speaker,
+      kind: item.state as 'stale' | 'duplicate',
+      kindLabel: segmentStateLabel(item.state),
+      detectedAt: item.flaggedAt ?? now,
+      text: item.corrected,
+      note: item.staleReason ?? '',
+    }));
+
+  const previous = model.handovers[model.handovers.length - 1];
+  const resolved: HandoverResolution[] = [];
+  if (previous) {
+    for (const open of previous.openItems) {
+      const current = model.segments.find((item) => item.id === open.segmentId);
+      if (!current) {
+        resolved.push({ segmentId: open.segmentId, sequence: open.sequence, speaker: open.speaker, wasLabel: open.stateLabel, nowLabel: '已不在队列', text: open.text });
+        continue;
+      }
+      if (isOpenForHandover(current)) continue;
+      const nowLabel = current.state === 'confirmed'
+        ? open.state === 'outbox' ? '已合并进直播区' : '已确认进直播区'
+        : segmentStateLabel(current.state);
+      resolved.push({ segmentId: open.segmentId, sequence: open.sequence, speaker: open.speaker, wasLabel: open.stateLabel, nowLabel, text: open.text });
+    }
+  }
+
+  return {
+    id: `handover-${now.toString(36)}-${model.handovers.length + 1}`,
+    shift: model.handovers.length + 1,
+    createdAt: now,
+    connection: model.connection,
+    speakers: [...speakerStats.values()].sort((a, b) => b.revisions - a.revisions || (b.stale + b.duplicate) - (a.stale + a.duplicate)),
+    rules,
+    openItems,
+    recentRisks,
+    resolved,
+    totals: {
+      pending: model.segments.filter((item) => item.state === 'pending').length,
+      stale: model.segments.filter((item) => item.state === 'stale').length,
+      duplicate: model.segments.filter((item) => item.state === 'duplicate').length,
+      outbox: model.segments.filter((item) => item.state === 'confirmed' && item.source === 'offline').length,
+      confirmed: model.segments.filter((item) => item.state === 'confirmed').length,
+    },
+  };
+}
+
+/** 把冻结的交接快照导出为纯文本，方便粘贴到接班群或工单。 */
+export function handoverToText(report: HandoverReport): string {
+  const time = new Date(report.createdAt).toLocaleString('zh-CN', { hour12: false });
+  return [
+    `【值守交接 · 第 ${report.shift} 班】${time}`,
+    `队列：待确认 ${report.totals.pending} · 过期 ${report.totals.stale} · 重复 ${report.totals.duplicate} · 离线待合并 ${report.totals.outbox} · 已确认 ${report.totals.confirmed}`,
+    '',
+    '发言人汇总：',
+    ...report.speakers.map((stat) => `- ${stat.speaker}：修改 ${stat.revisions} 次（${stat.edited} 段）· 术语命中 ${stat.ruleHits} 段 · 专属规则 ${stat.scopedRuleUses} 次 · 待确认 ${stat.pending} · 过期 ${stat.stale} · 重复 ${stat.duplicate} · 已确认 ${stat.confirmed}`),
+    '',
+    '术语规则：',
+    ...(report.rules.length
+      ? report.rules.map((rule) => `- ${rule.source} → ${rule.replacement}（${rule.scope}）：已用 ${rule.usageCount} 次${rule.missed ? `，仍有 ${rule.missed} 段未应用` : '，已全部应用'}`)
+      : ['- 暂无规则']),
+    '',
+    `未处理片段（${report.openItems.length}）：`,
+    ...(report.openItems.length
+      ? report.openItems.map((item) => `- [${item.stateLabel}] #${item.sequence} ${item.speaker}：${item.text}（等待 ${item.waitSeconds} 秒）${item.note ? `｜${item.note}` : ''}`)
+      : ['- 无']),
+    '',
+    `最近 10 分钟新增风险（${report.recentRisks.length}）：`,
+    ...(report.recentRisks.length
+      ? report.recentRisks.map((risk) => `- [${risk.kindLabel}] #${risk.sequence} ${risk.speaker}：${risk.note || risk.text}`)
+      : ['- 无']),
+    '',
+    `自上一份交接已解决（${report.resolved.length}）：`,
+    ...(report.resolved.length
+      ? report.resolved.map((item) => `- #${item.sequence} ${item.speaker}：${item.wasLabel} → ${item.nowLabel}`)
+      : ['- 无']),
+  ].join('\n');
 }
 
 export function createLiveSegment(sequence: number): CaptionSegment {
@@ -273,12 +518,12 @@ export function simulateLatency(model: DeskModel): DeskModel {
   if (applyStream) {
     const candidate = createLiveSegment(model.nextSequence);
     const duplicate = isDuplicate(candidate, segments);
-    segments = [...segments, duplicate ? { ...candidate, state: 'duplicate', duplicateOf: duplicate.id, staleReason: `与第 ${duplicate.sequence} 段重复` } : candidate];
+    segments = [...segments, duplicate ? { ...candidate, state: 'duplicate', duplicateOf: duplicate.id, staleReason: `与第 ${duplicate.sequence} 段重复`, flaggedAt: Date.now() } : candidate];
     nextSequence += 1;
   }
   const pendingCutoff = Date.now() - 90_000;
   segments = segments.map((item) => item.state === 'pending' && item.receivedAt < pendingCutoff
-    ? { ...item, state: 'stale', staleReason: `片段已等待 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒` }
+    ? { ...item, state: 'stale', staleReason: `片段已等待 ${Math.round((Date.now() - item.receivedAt) / 1000)} 秒`, flaggedAt: Date.now() }
     : item);
   return {
     ...model,

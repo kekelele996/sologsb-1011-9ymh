@@ -2,17 +2,21 @@ import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
   applyRules,
+  buildHandoverReport,
   cloneModel,
   createInitialModel,
+  handoverToText,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
+  segmentStateLabel,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type HandoverReport,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -31,14 +35,17 @@ function formatAge(timestamp: number): string {
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒前`;
 }
 
+function formatTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+}
+
+function formatWait(seconds: number): string {
+  if (seconds < 60) return `${seconds} 秒`;
+  return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+}
+
 function stateLabel(state: SegmentState): string {
-  return {
-    pending: '待确认',
-    confirmed: '已确认',
-    duplicate: '重复片段',
-    stale: '过期修改',
-    ignored: '已忽略',
-  }[state];
+  return segmentStateLabel(state);
 }
 
 function connectionLabel(state: ConnectionState): string {
@@ -218,6 +225,41 @@ export class CaptionDesk extends LitElement {
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
 
+    .handover-actions { padding: 10px 12px; display: flex; gap: 8px; align-items: center; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .handover-meta { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; background: var(--cds-layer-02, #f4f4f4); border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .handover-meta-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .handover-meta strong { font-size: 11px; }
+    .handover-meta span { color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .handover-block { padding: 10px 12px 12px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .handover-block h4 { margin: 0 0 8px; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 11px; }
+    .handover-block h4 span { color: var(--cds-text-secondary, #525252); font-size: 9px; font-weight: 400; text-align: right; }
+    .handover-table { width: 100%; border-collapse: collapse; font-size: 10px; font-variant-numeric: tabular-nums; }
+    .handover-table th, .handover-table td { padding: 4px 5px; text-align: left; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); white-space: nowrap; }
+    .handover-table th { color: var(--cds-text-secondary, #525252); font-size: 9px; font-weight: 500; }
+    .handover-table tr.has-issue td { color: #8d6e00; }
+    .handover-item { padding: 7px 0; border-top: 1px dashed var(--cds-border-subtle, #e0e0e0); font-size: 10px; line-height: 1.5; }
+    .handover-item:first-of-type { border-top: 0; padding-top: 0; }
+    .handover-item p { margin: 4px 0 0; }
+    .handover-sub { margin-left: 6px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
+    .handover-note { color: #8d6e00; }
+    .handover-tag { display: inline-block; margin-right: 6px; padding: 1px 6px; font-size: 9px; background: #e0e0e0; color: #161616; }
+    .handover-tag.pending { background: #edf5ff; color: #0043ce; }
+    .handover-tag.stale { background: #fff1c6; color: #684e00; }
+    .handover-tag.duplicate { background: #f6f2ff; color: #491d8b; }
+    .handover-tag.outbox { background: #e8faff; color: #00539a; }
+    .handover-tag.missed { background: #fff1f1; color: #a2191f; }
+    .handover-tag.ok, .handover-tag.resolved { background: #defbe6; color: #0e6027; }
+    .handover-empty { padding: 10px 12px; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.5; }
+    .handover-block .handover-empty { padding: 2px 0 0; }
+    .handover-history-list { border-top: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .handover-history { border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .handover-history:last-child { border-bottom: 0; }
+    .handover-history > summary { cursor: pointer; padding: 9px 12px; color: var(--cds-text-secondary, #525252); font-size: 10px; list-style: none; }
+    .handover-history > summary::-webkit-details-marker { display: none; }
+    .handover-history > summary::before { content: '▸'; margin-right: 6px; }
+    .handover-history[open] > summary::before { content: '▾'; }
+    .handover-history > summary:hover { color: var(--cds-text-primary, #161616); }
+
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
 
@@ -273,7 +315,11 @@ export class CaptionDesk extends LitElement {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        if (parsed.segments?.length) {
+          // 旧版本草稿没有交接快照字段，迁移为空记录。
+          parsed.handovers = parsed.handovers ?? [];
+          return parsed;
+        }
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -473,8 +519,24 @@ export class CaptionDesk extends LitElement {
     if (!selected) return;
     this.commit('保留重复片段', (current) => ({
       ...current,
-      segments: current.segments.map((item) => item.id === selected.id ? { ...item, state: 'pending', duplicateOf: undefined, staleReason: '重复提示已由校对员确认保留' } : item),
+      segments: current.segments.map((item) => item.id === selected.id ? { ...item, state: 'pending', duplicateOf: undefined, staleReason: '重复提示已由校对员确认保留', flaggedAt: undefined } : item),
     }));
+  }
+
+  private generateHandover(): void {
+    const shift = this.model.handovers.length + 1;
+    // 快照只追加到 handovers，后续 commit 只改 segments/rules，不会改写已冻结的交接。
+    this.commit('', (current) => ({ ...current, handovers: [...current.handovers, buildHandoverReport(current)] }));
+    this.pushToast('success', `第 ${shift} 班值守交接已冻结`, '发言人统计、未处理片段与新增风险已快照，继续校对不会改写');
+  }
+
+  private async copyHandover(report: HandoverReport): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(handoverToText(report));
+      this.pushToast('success', `第 ${report.shift} 班交接文本已复制`, '可直接粘贴到接班群或工单');
+    } catch {
+      this.pushToast('warning', '复制失败', '浏览器未授权剪贴板，请手动记录交接内容');
+    }
   }
 
   private setConnection(connection: ConnectionState): void {
@@ -693,11 +755,133 @@ export class CaptionDesk extends LitElement {
     `;
   }
 
+  private renderHandoverBody(report: HandoverReport, isLatest: boolean) {
+    return html`
+      <div class="handover-body">
+        <div class="handover-meta">
+          <div class="handover-meta-row">
+            <strong>第 ${report.shift} 班 · ${formatTime(report.createdAt)} 冻结</strong>
+            ${!isLatest ? html`<cds-button kind="ghost" size="xs" @click=${() => this.copyHandover(report)}>复制文本</cds-button>` : nothing}
+          </div>
+          <span>${connectionLabel(report.connection)} · 待确认 ${report.totals.pending} · 过期 ${report.totals.stale} · 重复 ${report.totals.duplicate} · 离线待合并 ${report.totals.outbox}</span>
+        </div>
+
+        <div class="handover-block">
+          <h4>发言人汇总 <span>修改次数 / 规则使用 / 重复与过期</span></h4>
+          <table class="handover-table">
+            <thead>
+              <tr><th>发言人</th><th>修改</th><th>术语命中</th><th>专属规则</th><th>待确认</th><th>过期</th><th>重复</th><th>已确认</th></tr>
+            </thead>
+            <tbody>
+              ${report.speakers.map((stat) => html`
+                <tr class=${stat.stale + stat.duplicate > 0 ? 'has-issue' : ''}>
+                  <td>${stat.speaker}</td>
+                  <td>${stat.revisions} 次</td>
+                  <td>${stat.ruleHits} 段</td>
+                  <td>${stat.scopedRuleUses} 次</td>
+                  <td>${stat.pending}</td>
+                  <td>${stat.stale}</td>
+                  <td>${stat.duplicate}</td>
+                  <td>${stat.confirmed}</td>
+                </tr>
+              `)}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="handover-block">
+          <h4>术语规则使用 <span>未应用 = 仍有片段命中规则但没替换</span></h4>
+          ${report.rules.length ? report.rules.map((rule) => html`
+            <div class="handover-item">
+              <strong>${rule.source} → ${rule.replacement}</strong>
+              <span class="handover-sub">${rule.scope} · 已用 ${rule.usageCount} 次</span>
+              ${rule.missed > 0
+                ? html`<span class="handover-tag missed">未应用 ${rule.missed} 段</span>`
+                : html`<span class="handover-tag ok">全部已应用</span>`}
+            </div>
+          `) : html`<div class="handover-empty">暂无术语规则。</div>`}
+        </div>
+
+        <div class="handover-block">
+          <h4>未处理片段 <span>${report.openItems.length} 项交给接班继续</span></h4>
+          ${report.openItems.length ? report.openItems.map((item) => html`
+            <div class="handover-item">
+              <span class="handover-tag ${item.state}">${item.stateLabel}</span>
+              <strong>#${String(item.sequence).padStart(3, '0')} · ${item.speaker}</strong>
+              <span class="handover-sub">已等待 ${formatWait(item.waitSeconds)}</span>
+              <p>${item.text}</p>
+              ${item.note ? html`<p class="handover-note">${item.note}</p>` : nothing}
+            </div>
+          `) : html`<div class="handover-empty">没有未处理片段，队列已清空。</div>`}
+        </div>
+
+        <div class="handover-block">
+          <h4>最近 10 分钟新增风险 <span>${report.recentRisks.length} 项</span></h4>
+          ${report.recentRisks.length ? report.recentRisks.map((risk) => html`
+            <div class="handover-item">
+              <span class="handover-tag ${risk.kind}">${risk.kindLabel}</span>
+              <strong>#${String(risk.sequence).padStart(3, '0')} · ${risk.speaker}</strong>
+              <span class="handover-sub">${formatTime(risk.detectedAt)} 标记</span>
+              <p class="handover-note">${risk.note || risk.text}</p>
+            </div>
+          `) : html`<div class="handover-empty">最近 10 分钟没有新增重复或过期片段。</div>`}
+        </div>
+
+        <div class="handover-block">
+          <h4>自上一份交接已解决 <span>${report.resolved.length} 项</span></h4>
+          ${report.shift === 1
+            ? html`<div class="handover-empty">这是第一份交接；下一份开始会在这里列出已解决的异常。</div>`
+            : report.resolved.length ? report.resolved.map((item) => html`
+              <div class="handover-item">
+                <span class="handover-tag resolved">${item.nowLabel}</span>
+                <strong>#${String(item.sequence).padStart(3, '0')} · ${item.speaker}</strong>
+                <span class="handover-sub">原状态：${item.wasLabel}</span>
+                <p>${item.text}</p>
+              </div>
+            `) : html`<div class="handover-empty">上一份交接的未处理项都还在队列中。</div>`}
+        </div>
+      </div>
+    `;
+  }
+
+  private renderHandoverSection() {
+    const reports = [...this.model.handovers].sort((a, b) => b.createdAt - a.createdAt);
+    const latest = reports[0];
+    const history = reports.slice(1);
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>值守交接</h3>
+          <span>${reports.length ? `已冻结 ${reports.length} 份快照` : '换班前生成，接班按此核对'}</span>
+        </div>
+        <div class="handover-actions">
+          <cds-button kind="primary" size="sm" @click=${this.generateHandover}>生成交接快照</cds-button>
+          ${latest ? html`<cds-button kind="ghost" size="sm" @click=${() => this.copyHandover(latest)}>复制最新交接文本</cds-button>` : nothing}
+        </div>
+        ${latest ? html`
+          ${this.renderHandoverBody(latest, true)}
+          ${history.length ? html`
+            <div class="handover-history-list">
+              ${history.map((report) => html`
+                <details class="handover-history">
+                  <summary>第 ${report.shift} 班 · ${formatTime(report.createdAt)} 的原记录（已冻结 · 当时未处理 ${report.openItems.length} 项）</summary>
+                  ${this.renderHandoverBody(report, false)}
+                </details>
+              `)}
+            </div>
+          ` : nothing}
+        ` : html`<div class="handover-empty">还没有交接快照。点击“生成交接快照”后，当前发言人统计、未处理片段与新增风险会冻结保存，继续校对不会改写这份记录。</div>`}
+      </section>
+    `;
+  }
+
   private renderInspector() {
     const item = this.selected;
     const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
     return html`
       <div class="inspector">
+        ${this.renderHandoverSection()}
+
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>术语快捷规则</h3>
@@ -839,8 +1023,8 @@ export class CaptionDesk extends LitElement {
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <h2>交接 · 规则 · 直播区</h2>
+                <p>交接快照冻结保存；确认后进入直播输出，离线内容恢复后统一合并</p>
               </div>
               ${this.model.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
