@@ -4,6 +4,8 @@ import {
   applyRules,
   cloneModel,
   createInitialModel,
+  generateHandover,
+  HANDOVER_RISK_WINDOW_MS,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
@@ -13,6 +15,8 @@ import {
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type HandoverReport,
+  type HandoverRiskKind,
   type SegmentState,
   type ToastMessage,
 } from './model';
@@ -29,6 +33,26 @@ function formatAge(timestamp: number): string {
   const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
   if (seconds < 60) return `${seconds} 秒前`;
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒前`;
+}
+
+function formatDuration(totalSeconds: number): string {
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  return `${Math.floor(totalSeconds / 60)} 分 ${totalSeconds % 60} 秒`;
+}
+
+function formatDateTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+function riskLabel(kind: HandoverRiskKind): string {
+  return {
+    'new-stale': '新晋过期',
+    'new-duplicate': '疑似重复',
+    'new-pending': '到达未处理',
+    'offline-outbox': '离线积压',
+    'backlog': '队列积压',
+    'connection': '连接异常',
+  }[kind];
 }
 
 function stateLabel(state: SegmentState): string {
@@ -218,6 +242,47 @@ export class CaptionDesk extends LitElement {
     .live-item small { display: block; margin-top: 4px; color: var(--cds-text-secondary, #525252); font-size: 9px; }
     .delivery-status { margin: 0 10px 10px; padding: 9px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.45; }
 
+    .handover-actions { padding: 10px; display: flex; flex-direction: column; gap: 7px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .handover-actions p { margin: 0; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.5; }
+    .handover-list { padding: 8px 10px 12px; display: flex; flex-direction: column; gap: 7px; }
+    .handover-card { width: 100%; text-align: left; cursor: pointer; border: 1px solid var(--cds-border-subtle, #e0e0e0); border-left: 3px solid #8d8d8d; background: var(--cds-layer-02, #f4f4f4); color: inherit; padding: 9px 10px; }
+    .handover-card:hover { background: var(--cds-layer-hover, #e8e8e8); }
+    .handover-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .handover-card-head strong { font-size: 11px; }
+    .handover-card-head time { color: var(--cds-text-secondary, #525252); font: 500 9px/1 "IBM Plex Mono", monospace; }
+    .handover-card-meta { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .handover-card-meta b { color: var(--cds-text-primary, #161616); font-weight: 600; }
+    .handover-card-meta .warn b { color: #b28600; }
+    .handover-empty { padding: 12px 10px; color: var(--cds-text-secondary, #525252); font-size: 10px; line-height: 1.5; }
+
+    .handover-report { font-size: 12px; line-height: 1.55; color: var(--cds-text-primary, #161616); }
+    .handover-report h4 { margin: 18px 0 8px; font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+    .handover-report h4:first-child { margin-top: 0; }
+    .handover-report h4 span { color: var(--cds-text-secondary, #525252); font-weight: 400; font-size: 10px; }
+    .handover-frozen { margin: 0 0 4px; padding: 8px 10px; background: #edf5ff; border-left: 3px solid #0f62fe; color: #0043ce; font-size: 10px; line-height: 1.5; }
+    .handover-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 2px; }
+    .handover-chip { padding: 4px 8px; background: var(--cds-layer-02, #f4f4f4); border: 1px solid var(--cds-border-subtle, #e0e0e0); font-size: 10px; }
+    .handover-chip b { font-variant-numeric: tabular-nums; }
+    .handover-chip.warn b { color: #b28600; }
+    .handover-chip.danger b { color: #da1e28; }
+    .handover-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .handover-table th { text-align: left; padding: 5px 8px; color: var(--cds-text-secondary, #525252); font-weight: 500; font-size: 10px; border-bottom: 1px solid var(--cds-border-strong, #8d8d8d); white-space: nowrap; }
+    .handover-table td { padding: 6px 8px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); font-variant-numeric: tabular-nums; }
+    .handover-table tr.hot td { background: color-mix(in srgb, transparent 92%, #f1c21b 8%); }
+    .handover-flag { color: #b28600; font-weight: 600; }
+    .handover-open-item { padding: 8px 10px; margin-bottom: 6px; background: var(--cds-layer-02, #f4f4f4); border-left: 3px solid #f1c21b; }
+    .handover-open-item.duplicate { border-left-color: #a56eff; }
+    .handover-open-item.pending { border-left-color: #0f62fe; }
+    .handover-open-item .meta { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .handover-open-item p { margin: 5px 0 0; font-size: 11px; }
+    .handover-open-item .reason { margin-top: 4px; color: #8d6e00; font-size: 10px; }
+    .handover-risk { display: flex; gap: 8px; align-items: baseline; padding: 6px 10px; margin-bottom: 5px; background: var(--cds-layer-02, #f4f4f4); border-left: 3px solid #f1c21b; font-size: 11px; }
+    .handover-risk .kind { flex: 0 0 auto; padding: 1px 6px; background: #fff8e1; color: #684e00; font-size: 9px; }
+    .handover-risk small { display: block; color: var(--cds-text-secondary, #525252); font-size: 10px; margin-top: 2px; }
+    .handover-resolved { display: flex; gap: 8px; align-items: baseline; padding: 6px 10px; margin-bottom: 5px; background: var(--cds-layer-02, #f4f4f4); border-left: 3px solid #42be65; font-size: 11px; }
+    .handover-resolved small { color: var(--cds-text-secondary, #525252); font-size: 10px; }
+    .handover-none { margin: 0; padding: 8px 10px; color: var(--cds-text-secondary, #525252); font-size: 10px; background: var(--cds-layer-02, #f4f4f4); }
+
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
 
@@ -246,6 +311,7 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  @state() private activeHandoverId?: string;
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -273,7 +339,11 @@ export class CaptionDesk extends LitElement {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
+        if (parsed.segments?.length) {
+          // 旧版本草稿没有交接记录，补上空数组，已冻结的交接保持原样。
+          parsed.handovers = Array.isArray(parsed.handovers) ? parsed.handovers : [];
+          return parsed;
+        }
       }
     } catch {
       // 损坏草稿会回退到演示数据。
@@ -305,7 +375,8 @@ export class CaptionDesk extends LitElement {
     const previous = this.past.pop();
     if (!previous) return this.pushToast('info', '没有可撤销的修改', '历史记录为空');
     this.future = [cloneModel(this.model), ...this.future].slice(0, HISTORY_LIMIT);
-    this.model = previous;
+    // 交接快照一经冻结不参与撤销/重做，始终保留当前已生成的交接。
+    this.model = { ...previous, handovers: this.model.handovers };
     this.persist();
   }
 
@@ -313,7 +384,7 @@ export class CaptionDesk extends LitElement {
     const next = this.future.shift();
     if (!next) return;
     this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
-    this.model = next;
+    this.model = { ...next, handovers: this.model.handovers };
     this.persist();
   }
 
@@ -534,13 +605,21 @@ export class CaptionDesk extends LitElement {
     this.commit('删除术语规则', (current) => ({ ...current, rules: current.rules.filter((item) => item.id !== id) }));
   }
 
+  private createHandover(): void {
+    // 快照只追加、不改写：生成后即冻结，后续校对、撤销和合并都不会触碰历史交接。
+    const report = generateHandover(this.model);
+    this.model = { ...this.model, handovers: [...this.model.handovers, report] };
+    this.persist();
+    this.activeHandoverId = report.id;
+    this.pushToast('success', `第 ${report.index} 次交接已冻结`, `未处理 ${report.openItems.length} 段 · 新增风险 ${report.recentRisks.length} 项 · 已解决 ${report.resolved.length} 项`);
+  }
+
   private exportSrt(): void {
     const content = toSrt(this.model);
     if (!content) {
       this.pushToast('warning', '暂无已确认字幕', '先确认至少一个片段再导出');
       return;
-    }
-    const blob = new Blob([content], { type: 'application/x-subrip;charset=utf-8' });
+    }    const blob = new Blob([content], { type: 'application/x-subrip;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -585,6 +664,11 @@ export class CaptionDesk extends LitElement {
     if (event.altKey && event.key.toLocaleLowerCase() === 'k') {
       event.preventDefault();
       this.navigate(-1);
+      return;
+    }
+    if (event.altKey && event.key.toLocaleLowerCase() === 'h') {
+      event.preventDefault();
+      this.createHandover();
       return;
     }
     const punctuation: Record<string, string> = { '1': '，', '2': '。', '3': '？', '4': '！' };
@@ -698,6 +782,7 @@ export class CaptionDesk extends LitElement {
     const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
     return html`
       <div class="inspector">
+        ${this.renderHandoverSection()}
         <section class="inspector-section">
           <div class="inspector-section-head">
             <h3>术语快捷规则</h3>
@@ -760,6 +845,146 @@ export class CaptionDesk extends LitElement {
           </div>
         </section>
       </div>
+    `;
+  }
+
+  private renderHandoverSection() {
+    const reports = [...this.model.handovers].reverse();
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>值守交接</h3>
+          <span>${this.model.handovers.length ? `${this.model.handovers.length} 份已冻结` : '尚未生成交接'}</span>
+        </div>
+        <div class="handover-actions">
+          <cds-button kind="primary" size="sm" @click=${this.createHandover}>生成交接快照（Alt+H）</cds-button>
+          <p>按发言人汇总修改、规则使用、重复与过期；快照生成后立即冻结，后续校对不会改写，下一份会自动标出已解决的异常。</p>
+        </div>
+        ${reports.length ? html`
+          <div class="handover-list">
+            ${reports.map((report) => html`
+              <button class="handover-card" @click=${() => { this.activeHandoverId = report.id; }}>
+                <div class="handover-card-head">
+                  <strong>第 ${report.index} 次交接</strong>
+                  <time>${formatDateTime(report.createdAt)}</time>
+                </div>
+                <div class="handover-card-meta">
+                  <span class=${report.openItems.length ? 'warn' : ''}>未处理 <b>${report.openItems.length}</b></span>
+                  <span class=${report.recentRisks.length ? 'warn' : ''}>新增风险 <b>${report.recentRisks.length}</b></span>
+                  <span>已解决 <b>${report.resolved.length}</b></span>
+                  <span>已冻结</span>
+                </div>
+              </button>
+            `)}
+          </div>
+        ` : html`<div class="handover-empty">换班前生成一份快照，接班人即可看到发言人问题汇总、未处理片段和最近十分钟的新增风险。</div>`}
+      </section>
+    `;
+  }
+
+  private renderHandoverReport(report: HandoverReport) {
+    const ignoredRules = report.rules.filter((rule) => rule.pendingHits > 0);
+    return html`
+      <div class="handover-report">
+        <p class="handover-frozen">生成于 ${formatDateTime(report.createdAt)} · ${connectionLabel(report.connection)}。本快照已冻结，继续校对、撤销或合并都不会改写此交接。</p>
+        <div class="handover-chips">
+          <span class="handover-chip"><b>${report.stats.pending}</b> 待确认</span>
+          <span class="handover-chip ${report.stats.stale ? 'warn' : ''}"><b>${report.stats.stale}</b> 过期</span>
+          <span class="handover-chip ${report.stats.duplicate ? 'warn' : ''}"><b>${report.stats.duplicate}</b> 重复</span>
+          <span class="handover-chip ${report.stats.offline ? 'warn' : ''}"><b>${report.stats.offline}</b> 离线待合并</span>
+          <span class="handover-chip ${report.stats.backlog > 8 ? 'danger' : ''}"><b>${report.stats.backlog}</b> 积压</span>
+          <span class="handover-chip">最长等待 <b>${report.stats.oldestWaitSeconds}s</b></span>
+        </div>
+
+        <h4>发言人汇总 <span>按未处理问题排序，问题多的排在前面</span></h4>
+        <table class="handover-table">
+          <thead>
+            <tr><th>发言人</th><th>修改次数</th><th>规则应用</th><th>待确认</th><th>重复</th><th>过期</th><th>已确认</th><th>已忽略</th></tr>
+          </thead>
+          <tbody>
+            ${report.speakers.map((speaker, index) => html`
+              <tr class=${index === 0 && (speaker.stale + speaker.duplicate + speaker.pending) > 0 ? 'hot' : ''}>
+                <td>${speaker.speaker}${index === 0 && (speaker.stale + speaker.duplicate + speaker.pending) > 0 ? html` <span class="handover-flag">重点关注</span>` : nothing}</td>
+                <td>${speaker.revisions}</td>
+                <td>${speaker.ruleHits}</td>
+                <td>${speaker.pending}</td>
+                <td>${speaker.duplicate}</td>
+                <td>${speaker.stale}</td>
+                <td>${speaker.confirmed}</td>
+                <td>${speaker.ignored}</td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+
+        <h4>术语规则使用 <span>${ignoredRules.length ? `${ignoredRules.length} 条规则在未处理片段中仍被忽略` : '未处理片段均已套用规则'}</span></h4>
+        <table class="handover-table">
+          <thead>
+            <tr><th>规则</th><th>适用范围</th><th>累计使用</th><th>本班新增</th><th>未处理命中</th></tr>
+          </thead>
+          <tbody>
+            ${report.rules.map((rule) => html`
+              <tr class=${rule.pendingHits > 0 ? 'hot' : ''}>
+                <td>${rule.source} → ${rule.replacement}${rule.enabled ? '' : '（已停用）'}</td>
+                <td>${rule.speaker || '全部发言人'}</td>
+                <td>${rule.usageCount}</td>
+                <td>${report.previousId ? `+${rule.delta}` : '—'}</td>
+                <td>${rule.pendingHits > 0 ? html`<span class="handover-flag">${rule.pendingHits} 段未套用</span>` : '0'}</td>
+              </tr>
+            `)}
+          </tbody>
+        </table>
+
+        <h4>未处理片段 <span>${report.openItems.length ? `共 ${report.openItems.length} 段，接班人需逐段处理` : '交接时队列已清空'}</span></h4>
+        ${report.openItems.length ? report.openItems.map((item) => html`
+          <div class="handover-open-item ${item.state}">
+            <div class="meta">
+              <span>#${String(item.sequence).padStart(3, '0')}</span>
+              <span>${item.speaker}</span>
+              <span>${stateLabel(item.state)}</span>
+              <span>已等待 ${formatDuration(item.waitSeconds)}</span>
+            </div>
+            <p>${item.text}</p>
+            <div class="reason">${item.reason}</div>
+          </div>
+        `) : html`<p class="handover-none">生成快照时没有待确认、过期或重复片段。</p>`}
+
+        <h4>最近十分钟新增风险 <span>窗口 ${Math.round(HANDOVER_RISK_WINDOW_MS / 60_000)} 分钟</span></h4>
+        ${report.recentRisks.length ? report.recentRisks.map((risk) => html`
+          <div class="handover-risk">
+            <span class="kind">${riskLabel(risk.kind)}</span>
+            <div>${risk.label}<small>${risk.detail}</small></div>
+          </div>
+        `) : html`<p class="handover-none">最近十分钟没有新增过期、重复或积压风险。</p>`}
+
+        <h4>上一份遗留异常的处理结果 <span>${report.previousId ? '原记录保留在上一份交接中' : '首份交接'}</span></h4>
+        ${report.previousId
+          ? report.resolved.length
+            ? report.resolved.map((item) => html`
+              <div class="handover-resolved">
+                <span>#${String(item.sequence).padStart(3, '0')} ${item.speaker}</span>
+                <small>${stateLabel(item.previousState)} → ${item.resolvedAs === 'confirmed' ? '已确认' : item.resolvedAs === 'ignored' ? '已忽略' : '已移除'} · ${item.note}</small>
+              </div>
+            `)
+            : html`<p class="handover-none">上一份交接的未处理异常仍全部压着，请优先处理。</p>`
+          : html`<p class="handover-none">这是首份交接，下一份开始会在这里列出已解决的遗留异常。</p>`}
+      </div>
+    `;
+  }
+
+  private renderHandoverModal() {
+    const report = this.model.handovers.find((item) => item.id === this.activeHandoverId);
+    return html`
+      <cds-modal ?open=${Boolean(report)} @cds-modal-closed=${() => { this.activeHandoverId = undefined; }}>
+        <cds-modal-header>
+          <cds-modal-close-button></cds-modal-close-button>
+          <cds-modal-label>${this.model.eventName}</cds-modal-label>
+          <cds-modal-heading>${report ? `第 ${report.index} 次值守交接 · 已冻结` : ''}</cds-modal-heading>
+        </cds-modal-header>
+        <cds-modal-body>
+          ${report ? this.renderHandoverReport(report) : nothing}
+        </cds-modal-body>
+      </cds-modal>
     `;
   }
 
@@ -860,6 +1085,8 @@ export class CaptionDesk extends LitElement {
             ></cds-toast-notification>
           `)}
         </div>
+
+        ${this.renderHandoverModal()}
       </div>
     `;
   }

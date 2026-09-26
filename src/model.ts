@@ -31,11 +31,83 @@ export interface TermRule {
   createdAt: number;
 }
 
+export interface HandoverSpeakerSummary {
+  speaker: string;
+  total: number;
+  pending: number;
+  confirmed: number;
+  duplicate: number;
+  stale: number;
+  ignored: number;
+  revisions: number;
+  ruleHits: number;
+}
+
+export interface HandoverRuleUsage {
+  ruleId: string;
+  source: string;
+  replacement: string;
+  speaker: string;
+  enabled: boolean;
+  usageCount: number;
+  delta: number;
+  pendingHits: number;
+}
+
+export interface HandoverOpenItem {
+  segmentId: string;
+  sequence: number;
+  speaker: string;
+  state: SegmentState;
+  reason: string;
+  waitSeconds: number;
+  text: string;
+}
+
+export interface HandoverResolvedItem {
+  segmentId: string;
+  sequence: number;
+  speaker: string;
+  previousState: SegmentState;
+  resolvedAs: 'confirmed' | 'ignored' | 'removed';
+  note: string;
+}
+
+export type HandoverRiskKind = 'new-stale' | 'new-duplicate' | 'new-pending' | 'offline-outbox' | 'backlog' | 'connection';
+
+export interface HandoverRisk {
+  kind: HandoverRiskKind;
+  label: string;
+  detail: string;
+}
+
+export interface HandoverReport {
+  id: string;
+  index: number;
+  createdAt: number;
+  connection: ConnectionState;
+  stats: {
+    pending: number;
+    stale: number;
+    duplicate: number;
+    offline: number;
+    backlog: number;
+    oldestWaitSeconds: number;
+  };
+  speakers: HandoverSpeakerSummary[];
+  rules: HandoverRuleUsage[];
+  openItems: HandoverOpenItem[];
+  recentRisks: HandoverRisk[];
+  resolved: HandoverResolvedItem[];
+  previousId?: string;
+}
+
 export interface DeskModel {
   eventName: string;
   eventDate: string;
   segments: CaptionSegment[];
   rules: TermRule[];
+  handovers: HandoverReport[];
   selectedId: string;
   connection: ConnectionState;
   simulatedDelay: number;
@@ -104,6 +176,7 @@ export function createInitialModel(): DeskModel {
     eventName: '新品发布会现场字幕',
     eventDate: new Date(now).toISOString().slice(0, 10),
     segments: [...seededSegments, duplicate],
+    handovers: [],
     rules: [
       { id: 'term-1', source: 'co pilot', replacement: 'Co-Pilot', speaker: '', enabled: true, caseSensitive: false, usageCount: 4, createdAt: now - 86_400_000 },
       { id: 'term-2', source: 'studio cloud', replacement: 'Studio Cloud', speaker: '', enabled: true, caseSensitive: false, usageCount: 7, createdAt: now - 43_200_000 },
@@ -303,4 +376,121 @@ export function toSrt(model: DeskModel): string {
     .sort((a, b) => a.startTime - b.startTime)
     .map((item, index) => `${index + 1}\n${stamp(item.startTime)} --> ${stamp(item.startTime + 7)}\n[${item.speaker}] ${item.corrected}\n`)
     .join('\n');
+}
+
+export const HANDOVER_RISK_WINDOW_MS = 10 * 60_000;
+const HANDOVER_OPEN_STATES: SegmentState[] = ['pending', 'stale', 'duplicate'];
+
+function ruleMatcher(rule: TermRule): RegExp {
+  return new RegExp(rule.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), rule.caseSensitive ? '' : 'i');
+}
+
+/**
+ * 生成一份值守交接快照。返回的对象是完全独立的数据副本，
+ * 追加到 model.handovers 后不再被任何校对操作改写（冻结）。
+ */
+export function generateHandover(model: DeskModel, now = Date.now()): HandoverReport {
+  const previous = model.handovers[model.handovers.length - 1];
+  const openSegments = model.segments.filter((item) => HANDOVER_OPEN_STATES.includes(item.state));
+
+  const speakers = new Map<string, HandoverSpeakerSummary>();
+  for (const item of model.segments) {
+    const entry = speakers.get(item.speaker) ?? {
+      speaker: item.speaker, total: 0, pending: 0, confirmed: 0,
+      duplicate: 0, stale: 0, ignored: 0, revisions: 0, ruleHits: 0,
+    };
+    entry.total += 1;
+    entry.revisions += item.revision;
+    if (item.tags.includes('术语已应用')) entry.ruleHits += 1;
+    if (item.state === 'pending') entry.pending += 1;
+    else if (item.state === 'confirmed') entry.confirmed += 1;
+    else if (item.state === 'duplicate') entry.duplicate += 1;
+    else if (item.state === 'stale') entry.stale += 1;
+    else if (item.state === 'ignored') entry.ignored += 1;
+    speakers.set(item.speaker, entry);
+  }
+  const speakerSummary = [...speakers.values()].sort((a, b) =>
+    (b.stale + b.duplicate + b.pending) - (a.stale + a.duplicate + a.pending) || b.revisions - a.revisions);
+
+  const previousUsage = new Map((previous?.rules ?? []).map((rule) => [rule.ruleId, rule.usageCount]));
+  const ruleUsage: HandoverRuleUsage[] = model.rules.map((rule) => {
+    const matcher = ruleMatcher(rule);
+    const pendingHits = rule.enabled
+      ? openSegments.filter((item) => (!rule.speaker || rule.speaker === item.speaker) && matcher.test(item.corrected)).length
+      : 0;
+    return {
+      ruleId: rule.id,
+      source: rule.source,
+      replacement: rule.replacement,
+      speaker: rule.speaker,
+      enabled: rule.enabled,
+      usageCount: rule.usageCount,
+      delta: previous ? rule.usageCount - (previousUsage.get(rule.id) ?? 0) : 0,
+      pendingHits,
+    };
+  });
+
+  const openItems: HandoverOpenItem[] = [...openSegments]
+    .sort((a, b) => a.sequence - b.sequence)
+    .map((item) => ({
+      segmentId: item.id,
+      sequence: item.sequence,
+      speaker: item.speaker,
+      state: item.state,
+      reason: item.staleReason ?? (item.state === 'pending' ? '等待校对确认' : item.state === 'duplicate' ? '检测到重复片段' : '等待处理'),
+      waitSeconds: Math.max(0, Math.round((now - item.receivedAt) / 1000)),
+      text: item.corrected || item.original,
+    }));
+
+  const resolved: HandoverResolvedItem[] = (previous?.openItems ?? []).flatMap((item): HandoverResolvedItem[] => {
+    const current = model.segments.find((segment) => segment.id === item.segmentId);
+    const base = { segmentId: item.segmentId, sequence: item.sequence, speaker: item.speaker, previousState: item.state };
+    if (!current) return [{ ...base, resolvedAs: 'removed' as const, note: '片段已不在当前队列中' }];
+    if (HANDOVER_OPEN_STATES.includes(current.state)) return [];
+    if (current.state === 'confirmed') return [{ ...base, resolvedAs: 'confirmed' as const, note: '已确认并进入直播区' }];
+    if (current.state === 'ignored') return [{ ...base, resolvedAs: 'ignored' as const, note: '已人工忽略' }];
+    return [];
+  });
+
+  const windowStart = now - HANDOVER_RISK_WINDOW_MS;
+  const recentRisks: HandoverRisk[] = [];
+  for (const item of model.segments) {
+    const arrivedSeconds = Math.max(0, Math.round((now - item.receivedAt) / 1000));
+    if (item.state === 'stale' && item.receivedAt + 90_000 >= windowStart) {
+      recentRisks.push({ kind: 'new-stale', label: `片段 #${item.sequence} 刚转为过期`, detail: `${item.speaker} · ${item.staleReason ?? '等待超过 90 秒'}` });
+    }
+    if (item.state === 'duplicate' && item.receivedAt >= windowStart) {
+      recentRisks.push({ kind: 'new-duplicate', label: `片段 #${item.sequence} 疑似重复`, detail: `${item.speaker} · ${item.staleReason ?? '与已有片段高度相似'}` });
+    }
+    if (item.state === 'pending' && item.receivedAt >= windowStart) {
+      recentRisks.push({ kind: 'new-pending', label: `片段 #${item.sequence} 到达后未处理`, detail: `${item.speaker} · 已等待 ${arrivedSeconds} 秒` });
+    }
+  }
+  const offlineOutbox = model.segments.filter((item) => item.source === 'offline' && item.state === 'confirmed');
+  if (offlineOutbox.length) {
+    recentRisks.push({ kind: 'offline-outbox', label: `离线发件箱积压 ${offlineOutbox.length} 段`, detail: '恢复连接后需按时间顺序合并，合并前不要重复确认' });
+  }
+  const stats = queueStats(model);
+  if (stats.backlog > 8) {
+    recentRisks.push({ kind: 'backlog', label: `队列积压 ${stats.backlog} 段`, detail: `最长等待 ${stats.oldestWaitSeconds} 秒，建议优先处理过期片段` });
+  }
+  if (model.connection !== 'connected') {
+    recentRisks.push({ kind: 'connection', label: model.connection === 'offline' ? '当前处于离线校正' : '连接延迟波动', detail: model.connection === 'offline' ? '确认内容暂存离线发件箱' : `模拟延迟 ${model.simulatedDelay.toFixed(1)} 秒` });
+  }
+  const riskOrder: HandoverRiskKind[] = ['new-stale', 'new-duplicate', 'offline-outbox', 'backlog', 'connection', 'new-pending'];
+  recentRisks.sort((a, b) => riskOrder.indexOf(a.kind) - riskOrder.indexOf(b.kind));
+
+  return {
+    id: `handover-${now.toString(36)}-${model.handovers.length + 1}`,
+    index: model.handovers.length + 1,
+    createdAt: now,
+    connection: model.connection,
+    stats,
+    speakers: speakerSummary,
+    rules: ruleUsage,
+    openItems,
+    recentRisks,
+    resolved,
+    previousId: previous?.id,
+  };
 }
